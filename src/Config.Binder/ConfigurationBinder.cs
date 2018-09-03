@@ -206,7 +206,7 @@ namespace Microsoft.Extensions.Configuration
                 return;
             }
 
-            propertyValue = BindInstance(property.PropertyType, propertyValue, config.GetSection(property.Name), options);
+            propertyValue = BindInstance(property.PropertyType, propertyValue, config.GetSection(property.Name), options, property);
 
             if (propertyValue != null && hasSetter)
             {
@@ -214,16 +214,17 @@ namespace Microsoft.Extensions.Configuration
             }
         }
 
-        private static object BindToCollection(TypeInfo typeInfo, IConfiguration config, BinderOptions options)
+        private static object BindToCollection(TypeInfo typeInfo, IConfiguration config, BinderOptions options, PropertyInfo propertyToBindFor)
         {
             var type = typeof(List<>).MakeGenericType(typeInfo.GenericTypeArguments[0]);
             var instance = Activator.CreateInstance(type);
-            BindCollection(instance, type, config, options);
+            BindCollection(instance, type, config, options, propertyToBindFor);
             return instance;
         }
 
         // Try to create an array/dictionary instance to back various collection interfaces
-        private static object AttemptBindToCollectionInterfaces(Type type, IConfiguration config, BinderOptions options)
+        private static object AttemptBindToCollectionInterfaces(Type type, IConfiguration config, BinderOptions options,
+            PropertyInfo propertyToBindFor)
         {
             var typeInfo = type.GetTypeInfo();
 
@@ -236,7 +237,7 @@ namespace Microsoft.Extensions.Configuration
             if (collectionInterface != null)
             {
                 // IEnumerable<T> is guaranteed to have exactly one parameter
-                return BindToCollection(typeInfo, config, options);
+                return BindToCollection(typeInfo, config, options, propertyToBindFor);
             }
 
             collectionInterface = FindOpenGenericInterface(typeof(IReadOnlyDictionary<,>), type);
@@ -244,7 +245,7 @@ namespace Microsoft.Extensions.Configuration
             {
                 var dictionaryType = typeof(Dictionary<,>).MakeGenericType(typeInfo.GenericTypeArguments[0], typeInfo.GenericTypeArguments[1]);
                 var instance = Activator.CreateInstance(dictionaryType);
-                BindDictionary(instance, dictionaryType, config, options);
+                BindDictionary(instance, dictionaryType, config, options, propertyToBindFor);
                 return instance;
             }
 
@@ -252,7 +253,7 @@ namespace Microsoft.Extensions.Configuration
             if (collectionInterface != null)
             {
                 var instance = Activator.CreateInstance(typeof(Dictionary<,>).MakeGenericType(typeInfo.GenericTypeArguments[0], typeInfo.GenericTypeArguments[1]));
-                BindDictionary(instance, collectionInterface, config, options);
+                BindDictionary(instance, collectionInterface, config, options, propertyToBindFor);
                 return instance;
             }
 
@@ -260,27 +261,50 @@ namespace Microsoft.Extensions.Configuration
             if (collectionInterface != null)
             {
                 // IReadOnlyCollection<T> is guaranteed to have exactly one parameter
-                return BindToCollection(typeInfo, config, options);
+                return BindToCollection(typeInfo, config, options, propertyToBindFor);
             }
 
             collectionInterface = FindOpenGenericInterface(typeof(ICollection<>), type);
             if (collectionInterface != null)
             {
                 // ICollection<T> is guaranteed to have exactly one parameter
-                return BindToCollection(typeInfo, config, options);
+                return BindToCollection(typeInfo, config, options, propertyToBindFor);
             }
 
             collectionInterface = FindOpenGenericInterface(typeof(IEnumerable<>), type);
             if (collectionInterface != null)
             {
                 // IEnumerable<T> is guaranteed to have exactly one parameter
-                return BindToCollection(typeInfo, config, options);
+                return BindToCollection(typeInfo, config, options, propertyToBindFor);
             }
 
             return null;
         }
 
-        private static object BindInstance(Type type, object instance, IConfiguration config, BinderOptions options)
+        private static TypeConverter GetTypeConverter(TypeConverterAttribute attr, Type itemType)
+        {
+            Type type = Type.GetType(attr.ConverterTypeName);
+
+            if (type == null || !typeof(TypeConverter).IsAssignableFrom(type))
+            {
+                return null;
+            }
+
+            ConstructorInfo ctor = type.GetConstructor(new Type[] { typeof(Type) });
+
+            return (ctor != null)
+                ? (TypeConverter)ctor.Invoke(new object[] { itemType })
+                : (TypeConverter)Activator.CreateInstance(type);
+        }
+
+        private static IEnumerable<TypeConverter> GetTypeConverters(PropertyInfo property)
+            => property
+            .GetCustomAttributes<TypeConverterAttribute>(true)
+            .Select(attr => GetTypeConverter(attr, property.DeclaringType))
+            .Where(x => x != null);
+
+        private static object BindInstance(Type type, object instance, IConfiguration config, BinderOptions options,
+            PropertyInfo propertyToBindFor = null)
         {
             // if binding IConfigurationSection, break early
             if (type == typeof(IConfigurationSection))
@@ -292,15 +316,22 @@ namespace Microsoft.Extensions.Configuration
             var configValue = section?.Value;
             object convertedValue;
             Exception error;
-            if (configValue != null && TryConvertValue(type, configValue, out convertedValue, out error))
+            if (configValue != null)
             {
-                if (error != null)
-                {
-                    throw error;
-                }
+                var typeConverters = propertyToBindFor != null && options.SupportTypeConverterAttribute
+                    ? GetTypeConverters(propertyToBindFor)
+                    : Enumerable.Empty<TypeConverter>();
 
-                // Leaf nodes are always reinitialized
-                return convertedValue;
+                if (TryConvertValue(type, configValue, out convertedValue, out error, typeConverters))
+                {
+                    if (error != null)
+                    {
+                        throw error;
+                    }
+
+                    // Leaf nodes are always reinitialized
+                    return convertedValue;
+                }
             }
 
             if (config != null && config.GetChildren().Any())
@@ -309,7 +340,7 @@ namespace Microsoft.Extensions.Configuration
                 if (instance == null)
                 {
                     // We are alrady done if binding to a new collection instance worked
-                    instance = AttemptBindToCollectionInterfaces(type, config, options);
+                    instance = AttemptBindToCollectionInterfaces(type, config, options, propertyToBindFor);
                     if (instance != null)
                     {
                         return instance;
@@ -322,11 +353,11 @@ namespace Microsoft.Extensions.Configuration
                 var collectionInterface = FindOpenGenericInterface(typeof(IDictionary<,>), type);
                 if (collectionInterface != null)
                 {
-                    BindDictionary(instance, collectionInterface, config, options);
+                    BindDictionary(instance, collectionInterface, config, options, propertyToBindFor);
                 }
                 else if (type.IsArray)
                 {
-                    instance = BindArray((Array)instance, config, options);
+                    instance = BindArray((Array)instance, config, options, propertyToBindFor);
                 }
                 else
                 {
@@ -334,7 +365,7 @@ namespace Microsoft.Extensions.Configuration
                     collectionInterface = FindOpenGenericInterface(typeof(ICollection<>), type);
                     if (collectionInterface != null)
                     {
-                        BindCollection(instance, collectionInterface, config, options);
+                        BindCollection(instance, collectionInterface, config, options, propertyToBindFor);
                     }
                     // Something else
                     else
@@ -382,7 +413,8 @@ namespace Microsoft.Extensions.Configuration
             }
         }
 
-        private static void BindDictionary(object dictionary, Type dictionaryType, IConfiguration config, BinderOptions options)
+        private static void BindDictionary(object dictionary, Type dictionaryType, IConfiguration config, BinderOptions options
+            , PropertyInfo propertyToBindFor)
         {
             var typeInfo = dictionaryType.GetTypeInfo();
 
@@ -404,7 +436,8 @@ namespace Microsoft.Extensions.Configuration
                     type: valueType,
                     instance: null,
                     config: child,
-                    options: options);
+                    options: options,
+                    propertyToBindFor: propertyToBindFor);
                 if (item != null)
                 {
                     if (keyType == typeof(string))
@@ -421,7 +454,8 @@ namespace Microsoft.Extensions.Configuration
             }
         }
 
-        private static void BindCollection(object collection, Type collectionType, IConfiguration config, BinderOptions options)
+        private static void BindCollection(object collection, Type collectionType, IConfiguration config, BinderOptions options,
+            PropertyInfo propertyToBindFor)
         {
             var typeInfo = collectionType.GetTypeInfo();
 
@@ -437,7 +471,8 @@ namespace Microsoft.Extensions.Configuration
                         type: itemType,
                         instance: null,
                         config: section,
-                        options: options);
+                        options: options,
+                        propertyToBindFor: propertyToBindFor);
                     if (item != null)
                     {
                         addMethod.Invoke(collection, new[] { item });
@@ -449,7 +484,7 @@ namespace Microsoft.Extensions.Configuration
             }
         }
 
-        private static Array BindArray(Array source, IConfiguration config, BinderOptions options)
+        private static Array BindArray(Array source, IConfiguration config, BinderOptions options, PropertyInfo propertyToBindFor)
         {
             var children = config.GetChildren().ToArray();
             var arrayLength = source.Length;
@@ -470,7 +505,8 @@ namespace Microsoft.Extensions.Configuration
                         type: elementType,
                         instance: null,
                         config: children[i],
-                        options: options);
+                        options: options,
+                        propertyToBindFor: propertyToBindFor);
                     if (item != null)
                     {
                         newArray.SetValue(item, arrayLength + i);
@@ -484,7 +520,8 @@ namespace Microsoft.Extensions.Configuration
             return newArray;
         }
 
-        private static bool TryConvertValue(Type type, string value, out object result, out Exception error)
+        private static bool TryConvertValue(Type type, string value, out object result, out Exception error,
+            IEnumerable<TypeConverter> typeConverters = null)
         {
             error = null;
             result = null;
@@ -493,30 +530,45 @@ namespace Microsoft.Extensions.Configuration
                 result = value;
                 return true;
             }
-  
+
             if (type.GetTypeInfo().IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>))
             {
                 if (string.IsNullOrEmpty(value))
                 {
                     return true;
                 }
-                return TryConvertValue(Nullable.GetUnderlyingType(type), value, out result, out error);
+                return TryConvertValue(Nullable.GetUnderlyingType(type), value, out result, out error, typeConverters);
             }
-  
-            var converter = TypeDescriptor.GetConverter(type);
-            if (converter.CanConvertFrom(typeof(string)))
+
+            try
             {
-                try
-                {
-                    result = converter.ConvertFromInvariantString(value);
-                }
-                catch (Exception ex)
-                {
-                    error = new InvalidOperationException(Resources.FormatError_FailedBinding(value, type), ex);
-                }
+                return TryConvert(
+                    value,
+                    (typeConverters ?? Enumerable.Empty<TypeConverter>()).Concat(new[] { TypeDescriptor.GetConverter(type) }),
+                    out result);
+            }
+            catch (Exception ex)
+            {
+                error = new InvalidOperationException(Resources.FormatError_FailedBinding(value, type), ex);
+
                 return true;
             }
-  
+        }
+
+        private static bool TryConvert(string value, IEnumerable<TypeConverter> typeConverters, out object result)
+        {
+            result = null;
+
+            foreach (var converter in typeConverters)
+            {
+                if (converter.CanConvertFrom(typeof(string)))
+                {
+                    result = converter.ConvertFromInvariantString(value);
+
+                    return true;
+                }
+            }
+
             return false;
         }
 

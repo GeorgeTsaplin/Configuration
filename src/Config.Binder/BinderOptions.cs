@@ -13,5 +13,10 @@ namespace Microsoft.Extensions.Configuration
         /// If true, the binder will attempt to set all non read-only properties.
         /// </summary>
         public bool BindNonPublicProperties { get; set; }
+
+        /// <summary> Use <seealso cref="System.ComponentModel.TypeConverterAttribute"/> when converting configuration properties to POCO.
+        /// Default is False.
+        /// </summary>
+        public bool SupportTypeConverterAttribute { get; set; } = false;
     }
 }
